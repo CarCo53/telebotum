@@ -1,6 +1,5 @@
 import telebot
-import pandas as pd
-import os
+import sqlite3
 from fuzzywuzzy import fuzz, process
 
 # 📌 Telegram bot token'ı "token.txt" dosyasından alınıyor
@@ -9,9 +8,8 @@ with open("token.txt", "r") as file:
 
 bot = telebot.TeleBot(TOKEN)
 
-# 📌 Excel dosya yolları
-ILCE_BILGILERI_PATH = "ilcebilgileri.xlsx"
-USER_DATA_PATH = "user_data.xlsx"
+# 📌 SQL database yolu
+DATABASE_PATH = "bot_database.db"
 
 
 # 📌 Log fonksiyonu (Terminalde süreci izleyelim)
@@ -19,67 +17,118 @@ def log(message):
     print(f"[LOG] {message}")
 
 
-# 📌 User input log fonksiyonu
+# 📌 Kullanıcı girişlerini kaydetme fonksiyonu
 def log_user_input(user_id, input_text):
     print(f"[USER INPUT] UserID: {user_id}, Input: {input_text}")
 
 
-# 📌 Excel'den veri yükleme
-def load_ilce_data():
-    try:
-        df = pd.read_excel(ILCE_BILGILERI_PATH, dtype={"PlakaKodu": str})
-        log("İlçe bilgileri yüklendi.")
-        return df
-    except Exception as e:
-        log(f"Hata: İlçe bilgileri yüklenemedi. {str(e)}")
-        return None
+# 📌 Bot cevaplarını kaydetme fonksiyonu
+def log_bot_response(user_id, response_text):
+    print(f"[BOT RESPONSE] UserID: {user_id}, Response: {response_text}")
+
+
+# 📌 Veritabanı bağlantısı oluştur
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# 📌 Veritabanı tablolarını oluşturma
+def create_tables():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ilcebilgileri (
+            PlakaKodu TEXT,
+            City TEXT,
+            District TEXT,
+            Phone TEXT,
+            IPPhone TEXT
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_data (
+            UserID INTEGER PRIMARY KEY,
+            Username TEXT,
+            City TEXT,
+            District TEXT,
+            Role TEXT,
+            ContactPermission TEXT
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
 
 
 # 📌 Kullanıcı kayıt kontrolü
 def get_user_data(user_id):
-    if os.path.exists(USER_DATA_PATH):
-        df = pd.read_excel(USER_DATA_PATH)
-        user_row = df[df["UserID"] == user_id]
-        if not user_row.empty:
-            return user_row.iloc[0]
-    return None
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
+    cursor.execute("SELECT * FROM user_data WHERE UserID = ?", (user_id,))
+    user_data = cursor.fetchone()
 
-# 📌 İlgili vakıf çalışanlarını bul
-def get_relevant_staff(city, district):
-    if os.path.exists(USER_DATA_PATH):
-        df = pd.read_excel(USER_DATA_PATH)
-        staff = df[(df["City"].str.lower() == city.lower()) &
-                   (df["District"].str.lower() == district.lower()) &
-                   (df["ContactPermission"].str.lower() == "evet")]
-        if not staff.empty:
-            return staff[["UserID", "Username"]].to_dict('records')
-    return []
+    conn.close()
+    return user_data
 
 
 # 📌 Kullanıcı kaydetme / Güncelleme
 def save_user_data(user_id, username, city, district, permission):
-    data = {"UserID": [user_id], "Username": [username], "City": [city], "District": [district],
-            "ContactPermission": [permission]}
+    # user_id'yi tamsayıya dönüştür
+    user_id = int(user_id)
 
-    if os.path.exists(USER_DATA_PATH):
-        df = pd.read_excel(USER_DATA_PATH)
-        df = df[df["UserID"] != user_id]  # Eski kaydı sil
-        df = pd.concat([df, pd.DataFrame(data)], ignore_index=True)
-    else:
-        df = pd.DataFrame(data)
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-    df.to_excel(USER_DATA_PATH, index=False)
+    cursor.execute('''
+        INSERT INTO user_data (UserID, Username, City, District, ContactPermission)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(UserID) DO UPDATE SET
+        Username=excluded.Username,
+        City=excluded.City,
+        District=excluded.District,
+        ContactPermission=excluded.ContactPermission
+    ''', (user_id, username, city, district, permission))
+
+    conn.commit()
+    conn.close()
+
     log(f"Kullanıcı kaydedildi/güncellendi: {user_id} - {username} ({city}, {district})")
+
+
+# 📌 İlgili vakıf çalışanlarını bul
+def get_relevant_staff(city, district):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT UserID, Username FROM user_data
+        WHERE lower(City) = ? AND lower(District) = ? AND lower(ContactPermission) = 'evet'
+    ''', (city.lower(), district.lower()))
+    staff = cursor.fetchall()
+
+    conn.close()
+    return [dict(row) for row in staff]
 
 
 # 📌 Özel mesaja geçmeyi dene
 def try_send_private_message(user_id, text):
     try:
         bot.send_message(user_id, text)
+        log_bot_response(user_id, text)
         return True
     except:
         return False
+
+
+# 📌 Bot mesaj gönderme fonksiyonu
+def send_message(user_id, text, reply_markup=None):
+    bot.send_message(user_id, text, reply_markup=reply_markup)
+    log_bot_response(user_id, text)
 
 
 # 📌 /tani komutu
@@ -106,8 +155,8 @@ def handle_tani(message):
         return
 
     msg = bot.send_message(user_id, "Lütfen plaka kodunuzu girin:")
+    log_bot_response(user_id, "Lütfen plaka kodunuzu girin:")
     bot.register_next_step_handler(msg, ask_district)
-    log_user_input(user_id, message.text)
 
 
 # 📌 Kullanıcı bilgilerinin güncellenmesi
@@ -115,13 +164,14 @@ def update_user_data(message):
     user_id = message.from_user.id
     log_user_input(user_id, message.text)
     if message.text.lower() == "evet":
-        bot.send_message(message.chat.id, "Lütfen plaka kodunuzu girin:")
-        bot.register_next_step_handler(message, ask_district)
+        msg = bot.send_message(message.chat.id, "Lütfen plaka kodunuzu girin:")
+        log_bot_response(message.chat.id, "Lütfen plaka kodunuzu girin:")
+        bot.register_next_step_handler(msg, ask_district)
     else:
         markup = telebot.types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
         markup.add("/talep")  # Kullanıcıya buton olarak /talep sunuluyor
-        bot.send_message(message.chat.id, "Bilgileriniz değiştirilmeyecek. Dilerseniz transfer /talep edebilirsiniz.",
-                         reply_markup=markup)
+        send_message(message.chat.id, "Bilgileriniz değiştirilmeyecek. Dilerseniz transfer /talep edebilirsiniz.",
+                     reply_markup=markup)
 
 
 # 📌 İlçeyi sor
@@ -129,24 +179,26 @@ def ask_district(message):
     user_id = message.from_user.id
     log_user_input(user_id, message.text)
     plaka_kodu = message.text.strip()
-    df = load_ilce_data()
 
-    if df is None or plaka_kodu not in df["PlakaKodu"].values:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM ilcebilgileri WHERE PlakaKodu = ?", (plaka_kodu,))
+    districts = cursor.fetchall()
+    conn.close()
+
+    if not districts:
         msg = bot.send_message(user_id, "Geçersiz plaka kodu! Tekrar girin:")
+        log_bot_response(user_id, "Geçersiz plaka kodu! Tekrar girin:")
         bot.register_next_step_handler(msg, ask_district)
         return
 
     # İlçeleri listele ve butonlarla sun
-    available_districts = df[df["PlakaKodu"] == plaka_kodu]["District"].unique()
-    if len(available_districts) == 0:
-        bot.send_message(user_id, "İlgili plaka kodu için ilçe bulunamadı.")
-        return
-
     markup = telebot.types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-    for district in available_districts:
-        markup.add(district)
+    for district in districts:
+        markup.add(district["District"])
 
     msg = bot.send_message(user_id, "Lütfen ilçenizi seçin:", reply_markup=markup)
+    log_bot_response(user_id, "Lütfen ilçenizi seçin:")
     bot.register_next_step_handler(msg, ask_contact_permission, plaka_kodu)
 
 
@@ -160,6 +212,7 @@ def ask_contact_permission(message, plaka_kodu):
     markup.add("Evet", "Hayır")
 
     msg = bot.send_message(user_id, "İletişime geçilmesine izin veriyor musunuz?", reply_markup=markup)
+    log_bot_response(user_id, "İletişime geçilmesine izin veriyor musunuz?")
     bot.register_next_step_handler(msg, finalize_registration, plaka_kodu, selected_district)
 
 
@@ -170,15 +223,18 @@ def finalize_registration(message, plaka_kodu, district):
     username = message.from_user.username
     permission = message.text.strip()
 
-    df = load_ilce_data()
-    if df is None:
-        bot.send_message(user_id, "İlçe bilgileri yüklenemedi.")
-        return
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT City FROM ilcebilgileri WHERE District = ?", (district,))
+    city_row = cursor.fetchone()
+    conn.close()
 
-    city = df[df["District"].str.lower() == district.lower()]["City"].values[0]
-
-    save_user_data(user_id, username, city, district, permission)
-    bot.send_message(user_id, "Kayıt tamamlandı! Artık /talep komutunu kullanabilirsiniz. ✅")
+    if city_row:
+        city = city_row["City"]
+        save_user_data(user_id, username, city, district, permission)
+        send_message(user_id, "Kayıt tamamlandı! Artık /talep komutunu kullanabilirsiniz. ✅")
+    else:
+        send_message(user_id, "İlçe bilgileri bulunamadı. Lütfen tekrar deneyin.")
 
 
 # 📌 /talep komutu
@@ -193,27 +249,28 @@ def handle_talep(message):
         return
 
     if get_user_data(user_id) is None:
-        bot.send_message(user_id, "Önce kayıt olmalısınız. Lütfen /tani komutunu kullanın.")
+        send_message(user_id, "Önce kayıt olmalısınız. Lütfen /tani komutunu kullanın.")
         return
 
+    msg = bot.send_message(user_id, "Lütfen talep tipini seçin:", reply_markup=get_talep_tipi_markup())
+    log_bot_response(user_id, "Lütfen talep tipini seçin:")
+    bot.register_next_step_handler(msg, ask_district_for_talep)
+
+
+def get_talep_tipi_markup():
     markup = telebot.types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
     markup.add("Hane", "Kişi")
-    msg = bot.send_message(user_id, "Talep türünü seçin:", reply_markup=markup)
-    bot.register_next_step_handler(msg, validate_talep_type)
+    return markup
 
 
-# Yeni fonksiyon
-def validate_talep_type(message):
+# 📌 Talep için ilçe adı sor
+def ask_district_for_talep(message):
     user_id = message.from_user.id
     log_user_input(user_id, message.text)
-    talep_tipi = message.text.strip()
+    talep_tipi = message.text.strip().lower()
 
-    if talep_tipi.lower() not in ["hane", "kişi"]:
-        msg = bot.send_message(user_id, "Geçersiz seçim! Lütfen 'Hane' veya 'Kişi' seçeneklerinden birini seçin:")
-        bot.register_next_step_handler(msg, validate_talep_type)
-        return
-
-    msg = bot.send_message(user_id, "Lütfen ilçeyi girin:")
+    msg = bot.send_message(user_id, "Lütfen ilçeyi girin:", reply_markup=telebot.types.ReplyKeyboardRemove())
+    log_bot_response(user_id, "Lütfen ilçeyi girin:")
     bot.register_next_step_handler(msg, process_district, talep_tipi)
 
 
@@ -221,124 +278,118 @@ def validate_talep_type(message):
 def process_district(message, talep_tipi):
     user_id = message.from_user.id
     log_user_input(user_id, message.text)
-    district = message.text.strip().lower()
+    district_input = message.text.strip().lower()
 
-    df_ilce = load_ilce_data()
-    if df_ilce is None:
-        bot.send_message(user_id, "İlçe bilgileri yüklenemedi.")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT District FROM ilcebilgileri")
+    districts = [row["District"].lower() for row in cursor.fetchall()]
+    conn.close()
+
+    # İlçe adı %100 doğruysa doğrudan işle
+    if district_input in districts:
+        handle_city_selection(message, district_input, talep_tipi, None)
         return
 
-    df_ilce["District"] = df_ilce["District"].astype(str).str.lower()  # Ensure all values in the District column are strings and lowercase
-    df_ilce["City"] = df_ilce["City"].astype(str).str.lower()  # Ensure all values in the City column are strings and lowercase
+    # FuzzyWuzzy ile en olası ilçeleri bul
+    matches = process.extract(district_input, districts, limit=4)
+    high_confidence_matches = [match for match in matches if match[1] > 80]
 
-    if district not in df_ilce["District"].tolist():
-        # Suggest possible districts
-        possible_districts = process.extractBests(district, df_ilce["District"].tolist(), scorer=fuzz.partial_ratio, score_cutoff=75)
-        if possible_districts:
-            suggestions = [dist[0] for dist in possible_districts]
-            suggestions.append("Değiştir")
-            markup = telebot.types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-            for suggestion in suggestions:
-                markup.add(suggestion)
-            msg = bot.send_message(user_id, "Hatalı ilçe girdiniz! Şunu mu demek istediniz?", reply_markup=markup)
-            bot.register_next_step_handler(msg, handle_corrected_district, talep_tipi)
-            return
-        else:
-            bot.send_message(user_id, "Hatalı ilçe girdiniz! Lütfen doğru ilçeyi yazın.")
-            return
-
-    # Check if the district is "merkez" or if the district name is shared by multiple cities
-    if district == "merkez" or df_ilce[df_ilce["District"] == district].shape[0] > 1:
-        if district == "merkez":
-            msg = bot.send_message(user_id, "Lütfen plaka kodunuzu yazın:")
-            bot.register_next_step_handler(msg, handle_plaka_kodu, talep_tipi, district)
-        else:
-            # Multiple cities have the same district name
-            possible_cities = df_ilce[df_ilce["District"] == district]["City"].unique()
-            markup = telebot.types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-            for city in possible_cities:
-                markup.add(city.title())
-            msg = bot.send_message(user_id, "Lütfen il seçin:", reply_markup=markup)
-            bot.register_next_step_handler(msg, handle_city_selection, talep_tipi, district)
-        return
-
-    finalize_talep_with_city(user_id, talep_tipi, district, df_ilce[df_ilce["District"] == district].iloc[0]["City"])
-
-
-def handle_corrected_district(message, talep_tipi):
-    user_id = message.from_user.id
-    log_user_input(user_id, message.text)
-    corrected_district = message.text.strip().lower()
-
-    if corrected_district == "değiştir":
-        msg = bot.send_message(user_id, "Lütfen doğru ilçeyi yazın:")
+    if not high_confidence_matches:
+        msg = bot.send_message(user_id, "Geçersiz ilçe girdiniz! Lütfen doğru ilçeyi yazın.",
+                               reply_markup=telebot.types.ReplyKeyboardRemove())
+        log_bot_response(user_id, "Geçersiz ilçe girdiniz! Lütfen doğru ilçeyi yazın.")
         bot.register_next_step_handler(msg, process_district, talep_tipi)
-    else:
-        process_district(message, talep_tipi)
+        return
+
+    # İlçeleri listele ve butonlarla sun
+    markup = telebot.types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+    for match in high_confidence_matches:
+        markup.add(match[0].title())
+    markup.add("Değiştir")
+
+    msg = bot.send_message(user_id, "Lütfen ilçenizi seçin veya 'Değiştir' butonuna basın:", reply_markup=markup)
+    log_bot_response(user_id, "Lütfen ilçenizi seçin veya 'Değiştir' butonuna basın:")
+    bot.register_next_step_handler(msg, validate_district_selection, talep_tipi, district_input)
 
 
-def handle_plaka_kodu(message, talep_tipi, district):
+# 📌 İlçe seçim doğrulama
+def validate_district_selection(message, talep_tipi, original_input):
     user_id = message.from_user.id
     log_user_input(user_id, message.text)
-    plaka_kodu = message.text.strip()
+    selected_district = message.text.strip().lower()
 
-    df_ilce = load_ilce_data()
-    if df_ilce is None or plaka_kodu not in df_ilce["PlakaKodu"].tolist():
-        msg = bot.send_message(user_id, "Geçersiz plaka kodu! Tekrar girin:")
-        bot.register_next_step_handler(msg, handle_plaka_kodu, talep_tipi, district)
+    if selected_district == "değiştir":
+        msg = bot.send_message(user_id, "Lütfen ilçeyi tekrar girin:", reply_markup=telebot.types.ReplyKeyboardRemove())
+        log_bot_response(user_id, "Lütfen ilçeyi tekrar girin:")
+        bot.register_next_step_handler(msg, process_district, talep_tipi)
         return
 
-    city_row = df_ilce[df_ilce["PlakaKodu"] == plaka_kodu]
-    if city_row.empty:
-        msg = bot.send_message(user_id, "Geçersiz plaka kodu! Tekrar girin:")
-        bot.register_next_step_handler(msg, handle_plaka_kodu, talep_tipi, district)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM ilcebilgileri WHERE lower(District) = ?", (selected_district,))
+    district_data = cursor.fetchone()
+    conn.close()
+
+    if not district_data:
+        msg = bot.send_message(user_id, "Geçersiz ilçe! Tekrar deneyin:",
+                               reply_markup=telebot.types.ReplyKeyboardRemove())
+        log_bot_response(user_id, "Geçersiz ilçe! Tekrar deneyin:")
+        bot.register_next_step_handler(msg, process_district, talep_tipi)
         return
 
-    city = city_row.iloc[0]["City"]
-    finalize_talep_with_city(user_id, talep_tipi, district, city)
+    handle_city_selection(message, selected_district, talep_tipi, district_data["City"])
 
 
-def handle_city_selection(message, talep_tipi, district):
+def handle_city_selection(message, selected_district, talep_tipi, city):
     user_id = message.from_user.id
     log_user_input(user_id, message.text)
-    selected_city = message.text.strip().lower()
 
-    df_ilce = load_ilce_data()
-    if df_ilce is None or selected_city not in df_ilce["City"].str.lower().tolist():
-        msg = bot.send_message(user_id, "Geçersiz il! Tekrar seçin:")
-        bot.register_next_step_handler(msg, handle_city_selection, talep_tipi, district)
-        return
+    if city is None:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT City FROM ilcebilgileri WHERE lower(District) = ?", (selected_district,))
+        city_row = cursor.fetchone()
+        conn.close()
+        if not city_row:
+            msg = bot.send_message(user_id, "İlçe ve şehir bilgileri uyumsuz. Lütfen tekrar deneyin.",
+                                   reply_markup=telebot.types.ReplyKeyboardRemove())
+            log_bot_response(user_id, "İlçe ve şehir bilgileri uyumsuz. Lütfen tekrar deneyin.")
+            bot.register_next_step_handler(msg, process_district, talep_tipi)
+            return
+        city = city_row["City"]
 
-    finalize_talep_with_city(user_id, talep_tipi, district, selected_city)
+    finalize_talep_with_city(user_id, selected_district, talep_tipi, city)
 
 
-def finalize_talep_with_city(user_id, talep_tipi, district, city):
-    df_ilce = load_ilce_data()
-    if df_ilce is None:
-        bot.send_message(user_id, "İlçe bilgileri yüklenemedi.")
+def finalize_talep_with_city(user_id, district, talep_tipi, city):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM ilcebilgileri WHERE lower(District) = ? AND lower(City) = ?", (district, city))
+    district_data = cursor.fetchone()
+
+    if not district_data:
+        send_message(user_id, "İlçe ve şehir bilgileri uyumsuz. Lütfen tekrar deneyin.",
+                     reply_markup=telebot.types.ReplyKeyboardRemove())
         return
 
     user_data = get_user_data(user_id)
     if user_data is None:
-        bot.send_message(user_id, "Kullanıcı verileri bulunamadı.")
+        send_message(user_id, "Kullanıcı verileri bulunamadı.", reply_markup=telebot.types.ReplyKeyboardRemove())
         return
 
     user_city = user_data["City"]
     user_district = user_data["District"]
 
-    talep_edilen_vakif_row = df_ilce[(df_ilce["District"].str.lower() == district) & (df_ilce["City"].str.lower() == city)]
-    if talep_edilen_vakif_row.empty:
-        bot.send_message(user_id, "İlçe ve şehir bilgileri uyumsuz. Lütfen tekrar deneyin.")
-        return
+    phone = district_data["Phone"]
+    ip_phone = district_data["IPPhone"]
 
-    talep_edilen_vakif_city = talep_edilen_vakif_row.iloc[0]["City"]
-    phone = talep_edilen_vakif_row.iloc[0]["Phone"]
-    ip_phone = talep_edilen_vakif_row.iloc[0]["IPPhone"]
-
-    relevant_staff = get_relevant_staff(talep_edilen_vakif_city, district)
+    relevant_staff = get_relevant_staff(city, district)
     if relevant_staff:
-        staff_list = "\n".join([f'    <a href="tg://user?id={staff["UserID"]}" class="mention">@{staff["Username"] if pd.notna(staff["Username"]) else "Kullanıcı"}</a>'
-                                for staff in relevant_staff])
+        staff_list = "\n".join([
+                                   f'    <a href="tg://user?id={staff["UserID"]}" class="mention">@{staff["Username"] if staff["Username"] else "Kullanıcı"}</a>'
+                                   for staff in relevant_staff])
     else:
         staff_list = "    Vakıf çalışanı bulunamadı"
 
@@ -346,14 +397,17 @@ def finalize_talep_with_city(user_id, talep_tipi, district, city):
                      f"Transfer Talebi Var! 📢\n\n"
                      f"    👤 Talep Eden Vakıf: {user_city} - {user_district}\n"
                      f"    🏠 Talep Türü: {talep_tipi}\n"
-                     f"    📍 Talep Edilen Vakıf: {talep_edilen_vakif_city} - {district}\n\n"
+                     f"    📍 Talep Edilen Vakıf: {city} - {district}\n\n"
                      f"    ☎️ İletişim Bilgileri:\n"
                      f"    📞 Telefon: {phone}\n"
                      f"    📱 IP Telefon: {ip_phone}\n\n"
                      f"    📌 İlgili Vakıf Çalışanları:\n"
                      f"{staff_list}",
                      parse_mode="HTML")
-    bot.send_message(user_id, "Talebiniz iletildi! ✅")
+    send_message(user_id, "Talebiniz iletildi! ✅", reply_markup=telebot.types.ReplyKeyboardRemove())
 
 
-bot.polling()
+# 📌 Bot başlatma
+if __name__ == "__main__":
+    create_tables()
+    bot.polling()
