@@ -156,10 +156,23 @@ def handle_talep(message):
         bot.send_message(user_id, "Önce kayıt olmalısınız. Lütfen /tani komutunu kullanın.")
         return
 
-    markup = telebot.types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-    markup.add("Hane", "Kişi")
-    msg = bot.send_message(user_id, "Talep türünü seçin:", reply_markup=markup)
-    bot.register_next_step_handler(msg, ask_district_for_talep)
+159| markup = telebot.types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+160| markup.add("Hane", "Kişi")
+161| msg = bot.send_message(user_id, "Talep türünü seçin:", reply_markup=markup)
+162| bot.register_next_step_handler(msg, validate_talep_type)
+
+# Yeni fonksiyon
+def validate_talep_type(message):
+    user_id = message.from_user.id
+    talep_tipi = message.text.strip()
+    
+    if talep_tipi not in ["Hane", "Kişi"]:
+        msg = bot.send_message(user_id, "Geçersiz seçim! Lütfen 'Hane' veya 'Kişi' seçeneklerinden birini seçin:")
+        bot.register_next_step_handler(msg, validate_talep_type)
+        return
+    
+    msg = bot.send_message(user_id, "Lütfen ilçeyi girin:")
+    bot.register_next_step_handler(msg, finalize_talep, talep_tipi)
 
 
 # 📌 Talep için ilçe girme
